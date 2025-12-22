@@ -1,15 +1,16 @@
 from datetime import datetime
 from uuid import uuid4
-from fastapi import APIRouter, Body, HTTPException, status
+from fastapi import APIRouter, Body, HTTPException, status, Query
+from fastapi_pagination import Page, paginate
 from pydantic import UUID4
+from sqlalchemy.future import select
+from sqlalchemy.exc import IntegrityError 
 
-from workout_api.atleta.schemas import AtletaIn, AtletaOut, AtletaUpdate
 from workout_api.atleta.models import AtletaModel
+from workout_api.atleta.schemas import AtletaIn, AtletaOut, AtletaUpdate
 from workout_api.categorias.models import CategoriaModel
 from workout_api.centro_treinamento.models import CentroTreinamentoModel
-
 from workout_api.contrib.dependencies import DatabaseDependency
-from sqlalchemy.future import select
 
 router = APIRouter()
 
@@ -45,34 +46,65 @@ async def post(
             status_code=status.HTTP_400_BAD_REQUEST, 
             detail=f'O centro de treinamento {centro_treinamento_nome} não foi encontrado.'
         )
+    
     try:
-        atleta_out = AtletaOut(id=uuid4(), created_at=datetime.utcnow(), **atleta_in.model_dump())
-        atleta_model = AtletaModel(**atleta_out.model_dump(exclude={'categoria', 'centro_treinamento'}))
-
+        # Aqui estava o erro: agora usamos atleta_in (que tem todos os dados: CPF, idade, etc)
+        atleta_model = AtletaModel(
+            id=uuid4(), 
+            created_at=datetime.utcnow(), 
+            **atleta_in.model_dump(exclude={'categoria', 'centro_treinamento'})
+        )
+        
         atleta_model.categoria_id = categoria.pk_id
         atleta_model.centro_treinamento_id = centro_treinamento.pk_id
         
         db_session.add(atleta_model)
         await db_session.commit()
-    except Exception:
+    except IntegrityError:
+        raise HTTPException(
+            status_code=303, 
+            detail=f"Já existe um atleta cadastrado com o cpf: {atleta_in.cpf}"
+        )
+    except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail='Ocorreu um erro ao inserir os dados no banco'
+            detail=f'Ocorreu um erro inesperado ao inserir os dados no banco: {str(e)}'
         )
 
-    return atleta_out
-
+    # Devolvemos um objeto que satisfaz o schema AtletaOut
+    return AtletaOut(
+        id=atleta_model.id, 
+        created_at=atleta_model.created_at,
+        **atleta_in.model_dump(),
+        categoria=categoria,
+        centro_treinamento=centro_treinamento
+    )
 
 @router.get(
     '/', 
     summary='Consultar todos os Atletas',
     status_code=status.HTTP_200_OK,
-    response_model=list[AtletaOut],
+    response_model=Page[AtletaOut],
 )
-async def query(db_session: DatabaseDependency) -> list[AtletaOut]:
-    atletas: list[AtletaOut] = (await db_session.execute(select(AtletaModel))).scalars().all()
+async def query(
+    db_session: DatabaseDependency,
+    nome: str = Query(None, description="Filtro por nome do atleta"),
+    cpf: str = Query(None, description="Filtro por CPF do atleta"),
+    limit: int = Query(10, description="Limite de registros por página"),
+    offset: int = Query(0, description="Deslocamento dos registros")
+) -> Page[AtletaOut]:
     
-    return [AtletaOut.model_validate(atleta) for atleta in atletas]
+    query_statment = select(AtletaModel)
+    
+    if nome:
+        query_statment = query_statment.filter(AtletaModel.nome == nome)
+    if cpf:
+        query_statment = query_statment.filter(AtletaModel.cpf == cpf)
+
+    result = await db_session.execute(query_statment)
+    atletas = result.scalars().all()
+    
+    return paginate(atletas)
 
 
 @router.get(
@@ -121,11 +153,10 @@ async def patch(id: UUID4, db_session: DatabaseDependency, atleta_up: AtletaUpda
 
     return atleta
 
-
 @router.delete(
     '/{id}', 
     summary='Deletar um Atleta pelo id',
-    status_code=status.HTTP_204_NO_CONTENT
+    status_code=status.HTTP_204_NO_CONTENT,
 )
 async def delete(id: UUID4, db_session: DatabaseDependency) -> None:
     atleta: AtletaOut = (
